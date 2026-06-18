@@ -1,0 +1,271 @@
+pragma silverscript ^0.1.0;
+
+// LP_AMM – Dual-phase liquidity pool (Bonding Curve → AMM)
+//
+// Transaction structure expected for each swap:
+//   inputs:
+//     [activeInputIndex] : vault covenant UTXO   (managed by this contract)
+//     [any other index]  : user wallet UTXO       (covers swap amount + 3% fee + network fee)
+//   outputs:
+//     [outIndex]         : vault covenant UTXO   (same scriptPubKey, updated state)
+//     [feeOutIndex]      : platform fee address  (3% of KAS flow)
+//     [...]              : user change / token receipt (not verified here)
+//
+// Network fees are NOT managed by this contract; they are implicitly consumed
+// by the difference between the user's wallet input(s) and their change output(s).
+
+contract LP_AMM(
+    int init_a,
+    int init_b,
+    int init_S1,
+    int init_S,
+    int init_binary_flag,
+    byte[32] init_token_id,
+    byte[36] init_fee_recipient,
+    int kcc20_prefix_len,
+    int kcc20_suffix_len,
+    byte[32] kcc20_hash,
+    byte[] kcc20_prefix,
+    byte[] kcc20_suffix
+) {
+    int binary_flag = init_binary_flag;        // 0: bonding curve, 1: AMM (irreversible once set to 1)
+    int a = init_a;
+    int b = init_b;
+    int S1 = init_S1;
+    int S = init_S;
+    byte[32] token_id = init_token_id;
+    byte[36] fee_recipient = init_fee_recipient;
+
+    struct KCC20State {
+        byte[32] ownerIdentifier;
+        byte identifierType;
+        int amount;
+        bool isMinter;
+    }
+
+    // Fee: 3 / 100
+    int constant FEE_NUM = 3;
+    int constant FEE_DEN = 100;
+
+    // Overflow-safe bounds for bonding curve arithmetic.
+    // The integral area formula evaluates (a * v / 2) * v.
+    // With MAX_A = 10_000 and MAX_SUPPLY = 10_000_000:
+    //   peak intermediate = (10_000 × 10_000_000 / 2) × 10_000_000
+    //                     = 5 × 10^17  <  int64_max (9.22 × 10^18) ✓
+    int constant MAX_A      = 10_000;
+    int constant MAX_B      = 1_000_000_000;
+    int constant MAX_SUPPLY = 10_000_000;
+
+    // Maximum number of additional KCC20 inputs to scan for duplicate-vault detection.
+    int constant MAX_KCC20_SCAN = 10;
+
+    // Immutability guard: economic parameters must never change.
+    function checkImmutableState(State prev, State next) {
+        require(next.a == prev.a);
+        require(next.b == prev.b);
+        require(next.S1 == prev.S1);
+        require(next.token_id == prev.token_id);
+        require(next.fee_recipient == prev.fee_recipient);
+    }
+
+    // Fee output guard: enforces that a transaction output sends the platform fee
+    // to fee_recipient. kas_amount is the gross KAS flow of this swap (before split).
+    function checkFeeOutput(State prev, int feeOutIndex, int kas_amount) {
+        int fee = (kas_amount * FEE_NUM) / FEE_DEN;
+        require(fee > 0);
+        require(tx.outputs[feeOutIndex].value >= fee);
+        require(tx.outputs[feeOutIndex].scriptPubKey == prev.fee_recipient);
+    }
+
+    #[covenant(binding = cov, from = 1, to = 1)]
+    function executeSwap(
+        State[] prevStates,
+        State[] newStates,
+        int outIndex,       // index of the vault continuation output
+        int feeOutIndex,    // index of the platform fee output (3% KAS)
+        byte[] userAddress,
+        int amount,
+        bool isBuy,
+        KCC20State nextKcc20
+    ) {
+        State prev = prevStates[0];
+        State next = newStates[0];
+
+        checkImmutableState(prev, next);
+
+        int kcc20_in_idx  = OpCovInputIdx(prev.token_id, 0);
+        int kcc20_out_idx = OpCovOutputIdx(prev.token_id, 0);
+
+        int k_in  = tx.inputs[kcc20_in_idx].value;
+        int k_out = tx.outputs[kcc20_out_idx].value;
+
+        KCC20State kcc20PrevState = readInputStateWithTemplate(
+            kcc20_in_idx,
+            kcc20_prefix_len,
+            kcc20_suffix_len,
+            kcc20_hash
+        );
+
+        // ── Input Spoofing Prevention ──
+        //
+        // Ensures that the only KCC20 UTXO belonging to this vault is the one found
+        // at kcc20_in_idx, and that no other KCC20 input in the transaction also
+        // claims ownership of this vault.
+        //
+        // Attack blocked: an attacker creates a fake KCC20 (owner=LP_AMM, low KAS)
+        // and places it before the real vault in the inputs. The contract would read
+        // k_in from the fake UTXO, allowing the real vault to be drained.
+        //
+        // Multiple KCC20 inputs with the same token_id are legitimate (user selling
+        // multiple own UTXOs), but only ONE may have owner == myCovId.
+        byte[32] myCovId = OpInputCovenantId(this.activeInputIndex);
+
+        require(kcc20PrevState.ownerIdentifier == myCovId);
+        require(kcc20PrevState.identifierType == 0x02);
+
+        int kcc20_total = OpCovInputCount(prev.token_id);
+        for(n, 1, kcc20_total, MAX_KCC20_SCAN) {
+            int other_kcc20_idx = OpCovInputIdx(prev.token_id, n);
+            KCC20State otherKcc20 = readInputStateWithTemplate(
+                other_kcc20_idx,
+                kcc20_prefix_len,
+                kcc20_suffix_len,
+                kcc20_hash
+            );
+            // Additional KCC20 inputs are allowed (e.g., user selling tokens),
+            // but none may claim to be another LP_AMM vault.
+            require(otherKcc20.ownerIdentifier != myCovId || otherKcc20.identifierType != 0x02);
+        }
+
+        // nextKcc20 must preserve the same owner, type and minter status as the vault.
+        require(nextKcc20.ownerIdentifier == kcc20PrevState.ownerIdentifier);
+        require(nextKcc20.identifierType == kcc20PrevState.identifierType);
+        require(nextKcc20.isMinter == kcc20PrevState.isMinter);
+
+        if (prev.binary_flag == 0) {
+            // ── PHASE 1: BONDING CURVE ──
+            // Price(S) = a·S + b  (linear marginal price)
+            // Cost     = ∫[S → S+Δ] Price(x)dx = area1 − area0
+
+            if (isBuy) {
+                // User buys `amount` tokens, pays KAS into vault.
+                int v0 = prev.S;
+                int v1 = prev.S + amount;
+
+                // Overflow guard: bounds ensure (a * v / 2) * v never exceeds int64_max.
+                require(prev.a <= MAX_A);
+                require(prev.b <= MAX_B);
+                require(v1 <= MAX_SUPPLY);
+
+                // Integral: a·V²/2 + b·V  (reformulated to halve the peak intermediate)
+                int area0 = (prev.a * v0 / 2) * v0 + (prev.b * v0);
+                int area1 = (prev.a * v1 / 2) * v1 + (prev.b * v1);
+                int cost  = area1 - area0;
+
+                require(k_out >= k_in + cost);
+                checkFeeOutput(prev, feeOutIndex, cost);
+
+                require(nextKcc20.amount == kcc20PrevState.amount - amount);
+                validateOutputStateWithTemplate(
+                    kcc20_out_idx,
+                    nextKcc20,
+                    kcc20_prefix,
+                    kcc20_suffix,
+                    kcc20_hash
+                );
+
+                require(next.S == v1);
+
+                if (next.S >= prev.S1) {
+                    require(next.binary_flag == 1);
+                } else {
+                    require(next.binary_flag == 0);
+                }
+
+            } else {
+                // User sells `amount` tokens, receives KAS from vault.
+                require(amount <= prev.S);
+
+                int v0 = prev.S;
+                int v1 = prev.S - amount;
+
+                require(prev.a <= MAX_A);
+                require(prev.b <= MAX_B);
+                require(v0 <= MAX_SUPPLY);
+
+                int area0  = (prev.a * v0 / 2) * v0 + (prev.b * v0);
+                int area1  = (prev.a * v1 / 2) * v1 + (prev.b * v1);
+                int refund = area0 - area1;
+
+                require(refund <= k_in);
+                require(k_out >= k_in - refund);
+                checkFeeOutput(prev, feeOutIndex, refund);
+
+                require(nextKcc20.amount == kcc20PrevState.amount + amount);
+                validateOutputStateWithTemplate(
+                    kcc20_out_idx,
+                    nextKcc20,
+                    kcc20_prefix,
+                    kcc20_suffix,
+                    kcc20_hash
+                );
+
+                require(next.S == v1);
+                require(next.binary_flag == 0);
+            }
+
+        } else {
+            // ── PHASE 2: CONSTANT-PRODUCT AMM ──
+            // Invariant: t_in × k_in == k_out × t_out
+            //
+            // The 3% fee is paid directly from the user's wallet to fee_recipient
+            // and never passes through the vault, so it does not alter the K product.
+
+            require(next.binary_flag == 1);
+            require(next.S == prev.S);
+
+            int t_in = kcc20PrevState.amount;
+
+            if (isBuy) {
+                // User buys KCC20 tokens, adds KAS to vault.
+                require(amount < t_in);
+
+                int t_out = t_in - amount;
+
+                // Overflow-safe constant-product invariant: k_gained = ceil((k_in * amount) / t_out)
+                int k_gained = (k_in / t_out) * amount + ((k_in % t_out) * amount + t_out - 1) / t_out;
+
+                require(k_out == k_in + k_gained);
+                checkFeeOutput(prev, feeOutIndex, k_gained);
+
+                require(nextKcc20.amount == t_out);
+                validateOutputStateWithTemplate(
+                    kcc20_out_idx,
+                    nextKcc20,
+                    kcc20_prefix,
+                    kcc20_suffix,
+                    kcc20_hash
+                );
+
+            } else {
+                // User sells KCC20 tokens, withdraws KAS from vault.
+                int t_out = t_in + amount;
+
+                // Overflow-safe constant-product invariant: k_paid = floor((k_in * amount) / t_out)
+                int k_paid = (k_in / t_out) * amount + ((k_in % t_out) * amount) / t_out;
+
+                require(k_out == k_in - k_paid);
+                checkFeeOutput(prev, feeOutIndex, k_paid);
+
+                require(nextKcc20.amount == t_out);
+                validateOutputStateWithTemplate(
+                    kcc20_out_idx,
+                    nextKcc20,
+                    kcc20_prefix,
+                    kcc20_suffix,
+                    kcc20_hash
+                );
+            }
+        }
+    }
+}

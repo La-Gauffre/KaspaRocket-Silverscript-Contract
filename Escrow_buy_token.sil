@@ -1,0 +1,185 @@
+pragma silverscript ^0.1.0;
+
+// Escrow_buy_token – Limit buy order: locked KAS → KCC20 tokens
+//
+// The creator locks KAS and specifies:
+//   - buyer_pk        : public key that will receive the tokens
+//   - kas_per_token   : fixed price (sompi per token)
+//   - tokens_remaining: total order size in tokens (decreases with each fill)
+//   - token_id        : identifier of the KCC20 contract
+//
+// Fill mechanism:
+//   Anyone can fill the order by supplying KCC20 tokens.
+//   In return they receive fill_amount * kas_per_token KAS from the escrow.
+//   Partial fills are supported: the escrow persists with tokens_remaining
+//   decremented until the order is fully consumed.
+//
+// ── Protection against "Double-Spend via LP_AMM" attack ──
+//
+// Attack scenario blocked:
+//   An attacker performs an LP_AMM buy swap that sends tokens to buyer_pk
+//   in the same transaction, then claims this satisfies the escrow —
+//   without bringing any tokens themselves.
+//
+// Defense:
+//   The contract scans ALL KCC20 inputs and only counts those with
+//   identifierType ≠ 0x02 (non-covenant). Protocol vaults (LP_AMM, other
+//   escrows) are type 0x02 and are excluded from the tally.
+//   → The attacker must hold their own tokens (type 0x00/0x01) to trigger a fill.
+//
+// Legitimate arbitrage:
+//   A market-maker holding tokens (type 0x00) may deliver them via a fill
+//   while simultaneously executing an LP_AMM swap in the same transaction.
+//   The LP_AMM vault (type 0x02) is excluded; only the market-maker's own
+//   token UTXOs are counted. This is intentionally allowed.
+//
+// Transaction structure expected for fill:
+//   inputs:
+//     [activeInputIndex]   : this escrow UTXO (holds the KAS)
+//     [KCC20 user inputs]  : user token UTXOs (type 0x00)
+//     [user wallet]        : covers network fees
+//   outputs:
+//     [escrow_out_idx]        : updated escrow (tokens_remaining decremented)
+//     [buyer_kcc20_out_idx]   : KCC20 to buyer_pk (exactly fill_amount tokens)  ← canonical
+//     [...]                   : fill_amount * kas_per_token KAS to filler
+//     [KCC20 change, ...]     : remaining user tokens (optional)
+
+contract Escrow_buy_token(
+    byte[32] init_creator_pk,
+    byte[32] init_buyer_pk,
+    int init_kas_per_token,
+    int init_tokens_remaining,
+    byte[32] init_token_id,
+    int kcc20_prefix_len,
+    int kcc20_suffix_len,
+    byte[32] kcc20_hash,
+    byte[] kcc20_prefix,
+    byte[] kcc20_suffix
+) {
+    byte[32] creator_pk      = init_creator_pk;
+    byte[32] buyer_pk        = init_buyer_pk;
+    int kas_per_token        = init_kas_per_token;
+    int tokens_remaining     = init_tokens_remaining;
+    byte[32] token_id        = init_token_id;
+
+    struct KCC20State {
+        byte[32] ownerIdentifier;
+        byte identifierType;
+        int amount;
+        bool isMinter;
+    }
+
+    byte constant IDENTIFIER_PUBKEY      = 0x00;
+    byte constant IDENTIFIER_SCRIPT_HASH = 0x01;
+    byte constant IDENTIFIER_COVENANT_ID = 0x02;
+
+    // Maximum number of user KCC20 inputs to scan in a single fill.
+    int constant MAX_USER_KCC20 = 10;
+
+    // Overflow guards: explicit bounds before fill_amount * kas_per_token.
+    // fill_amount * kas_per_token ≤ 10_000_000 × 1_000_000_000 = 10^16 < int64_max ✓
+    int constant MAX_KAS_PER_TOKEN = 1_000_000_000;
+    int constant MAX_FILL_AMOUNT   = 10_000_000;
+
+    // Immutability guard: economic parameters must never change.
+    function checkImmutable(State prev, State next) {
+        require(next.creator_pk    == prev.creator_pk);
+        require(next.buyer_pk      == prev.buyer_pk);
+        require(next.kas_per_token == prev.kas_per_token);
+        require(next.token_id      == prev.token_id);
+    }
+
+    // fill – partially or fully fills this buy order.
+    //
+    // Parameters:
+    //   escrow_out_idx      : index of the continuation output
+    //   fill_amount         : number of tokens delivered in this fill
+    //   buyer_kcc20_out_idx : index of the KCC20 output for buyer_pk
+    //   nextKcc20Buyer      : expected KCC20 state for the buyer output
+    //
+    // Canonical constraint: buyer_kcc20_out_idx == escrow_out_idx + 1
+    //   Each escrow has a unique escrow_out_idx (covenant system guarantee).
+    //   Tying the buyer output to escrow_out_idx + 1 makes it unique per escrow,
+    //   preventing aliasing attacks where multiple escrows share the same buyer
+    //   output (which would allow draining multiple escrows for the price of one fill).
+    #[covenant(binding = cov, from = 1, to = 1)]
+    function fill(
+        State[]    prevStates,
+        State[]    newStates,
+        int        escrow_out_idx,
+        int        fill_amount,
+        int        buyer_kcc20_out_idx,
+        KCC20State nextKcc20Buyer
+    ) {
+        State prev = prevStates[0];
+        State next = newStates[0];
+
+        // ── 1. Amount check ──
+        require(fill_amount > 0);
+        require(fill_amount <= prev.tokens_remaining);
+
+        // ── 2. KAS flow: escrow releases exactly fill_amount * kas_per_token ──
+        // Overflow guard: bounds checked before multiplication.
+        require(prev.kas_per_token <= MAX_KAS_PER_TOKEN);
+        require(fill_amount        <= MAX_FILL_AMOUNT);
+
+        int kas_released  = fill_amount * prev.kas_per_token;
+        int escrow_kas_in = tx.inputs[this.activeInputIndex].value;
+        require(kas_released <= escrow_kas_in);
+        require(tx.outputs[escrow_out_idx].value == escrow_kas_in - kas_released);
+
+        // ── 3. Token delivery: buyer_pk receives EXACTLY fill_amount tokens ──
+        //
+        // Canonical index (anti-aliasing):
+        //   If two escrows share the same buyer_pk and fill_amount, a simple ==
+        //   check would be fooled by pointing both at the same buyer output.
+        //   Tying the buyer index to the unique escrow output index prevents this.
+        require(buyer_kcc20_out_idx == escrow_out_idx + 1);
+
+        validateOutputStateWithTemplate(
+            buyer_kcc20_out_idx,
+            nextKcc20Buyer,
+            kcc20_prefix,
+            kcc20_suffix,
+            kcc20_hash
+        );
+        require(nextKcc20Buyer.ownerIdentifier == prev.buyer_pk);
+        require(nextKcc20Buyer.identifierType  == IDENTIFIER_PUBKEY);
+        require(nextKcc20Buyer.amount          == fill_amount);
+
+        // ── 4. Anti-double-spend: count only user-owned tokens ──
+        //
+        // Scan all KCC20 inputs and sum only those with identifierType ≠ 0x02.
+        // Covenant vaults (LP_AMM, other escrows) are excluded; the filler must
+        // bring their own tokens to satisfy this check.
+        int kcc20_total    = OpCovInputCount(prev.token_id);
+        int user_tokens_in = 0;
+        for (n, 0, kcc20_total, MAX_USER_KCC20) {
+            int kcc20_idx = OpCovInputIdx(prev.token_id, n);
+            KCC20State kcc20In = readInputStateWithTemplate(
+                kcc20_idx,
+                kcc20_prefix_len,
+                kcc20_suffix_len,
+                kcc20_hash
+            );
+            if (kcc20In.identifierType != IDENTIFIER_COVENANT_ID) {
+                user_tokens_in = user_tokens_in + kcc20In.amount;
+            }
+        }
+        require(user_tokens_in >= fill_amount);
+
+        // ── 5. State update ──
+        checkImmutable(prev, next);
+        require(next.tokens_remaining == prev.tokens_remaining - fill_amount);
+    }
+
+    // cancel – the creator recovers all locked KAS.
+    //
+    // With termination=allowed, an empty next_states array terminates the covenant
+    // without a continuation output.
+    #[covenant.singleton(mode = transition, termination = allowed)]
+    function cancel(State prev_state, State[] next_states, sig creator_sig) : (State[]) {
+        require(checkSig(creator_sig, prev_state.creator_pk));
+        return next_states;
+    }
+}
