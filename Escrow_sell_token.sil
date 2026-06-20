@@ -6,10 +6,12 @@ pragma silverscript ^0.1.0;
 // identifierType = 0x02) and specifies:
 //   - seller_spk    : scriptPubKey (36 bytes) where KAS payments are sent
 //   - kas_per_token : fixed price (sompi per token)
+//   - fee_recipient : platform fee address (receives 0.3% of each fill's KAS flow)
 //
 // Fill mechanism:
 //   Anyone can fill the order by sending kas_per_token * fill_amount KAS
 //   to seller_spk. In return they receive fill_amount tokens.
+//   The buyer also pays a 0.3% platform fee (from their own wallet) to fee_recipient.
 //   Partial fills are supported. The KCC20 vault decreases with each fill.
 //   The escrow covenant persists (immutable state); only the KCC20 vault changes.
 //
@@ -44,18 +46,20 @@ pragma silverscript ^0.1.0;
 //   inputs:
 //     [activeInputIndex]   : this escrow UTXO (dust)
 //     [kcc20 vault input]  : KCC20 vault (ownerIdentifier = myCovId, type 0x02)
-//     [buyer wallet]       : covers kas_owed + network fees
+//     [buyer wallet]       : covers kas_owed + 0.3% platform fee + network fees
 //   outputs:
 //     [escrow_out_idx]         : escrow unchanged (same state, dust preserved)
 //     [escrow_out_idx + 1]     : KCC20 to buyer_pk (fill_amount tokens)   ← canonical
 //     [escrow_out_idx + 2]     : KAS to seller_spk (≥ kas_owed)           ← canonical
 //     [kcc20_vault_out_idx]    : updated KCC20 vault (tokens - fill_amount)
+//     [feeOutIndex]            : 0.3% of kas_owed to fee_recipient         ← platform fee
 
 contract Escrow_sell_token(
     byte[32] init_creator_pk,
     byte[36] init_seller_spk,
     int init_kas_per_token,
     byte[32] init_token_id,
+    byte[36] init_fee_recipient,
     int kcc20_prefix_len,
     int kcc20_suffix_len,
     byte[32] kcc20_hash,
@@ -66,6 +70,7 @@ contract Escrow_sell_token(
     byte[36] seller_spk    = init_seller_spk;
     int kas_per_token      = init_kas_per_token;
     byte[32] token_id      = init_token_id;
+    byte[36] fee_recipient = init_fee_recipient;
 
     struct KCC20State {
         byte[32] ownerIdentifier;
@@ -77,6 +82,10 @@ contract Escrow_sell_token(
     byte constant IDENTIFIER_PUBKEY      = 0x00;
     byte constant IDENTIFIER_SCRIPT_HASH = 0x01;
     byte constant IDENTIFIER_COVENANT_ID = 0x02;
+
+    // Platform fee: 3 / 1000 = 0.3% of the KAS flow per fill.
+    int constant FEE_NUM = 3;
+    int constant FEE_DEN = 1000;
 
     // Maximum number of COV_B inputs to scan (including the escrow vault).
     // Mirrors LP_AMM (MAX_KCC20_SCAN = 10) to allow coexistence in the same transaction.
@@ -92,6 +101,16 @@ contract Escrow_sell_token(
         require(next.seller_spk    == prev.seller_spk);
         require(next.kas_per_token == prev.kas_per_token);
         require(next.token_id      == prev.token_id);
+        require(next.fee_recipient == prev.fee_recipient);
+    }
+
+    // Fee output guard: enforces that a transaction output sends the platform fee
+    // to fee_recipient. kas_amount is the gross KAS flow of this fill (before split).
+    function checkFeeOutput(State prev, int feeOutIndex, int kas_amount) {
+        int fee = (kas_amount * FEE_NUM) / FEE_DEN;
+        require(fee > 0);
+        require(tx.outputs[feeOutIndex].value >= fee);
+        require(tx.outputs[feeOutIndex].scriptPubKey == prev.fee_recipient);
     }
 
     // fill – partially or fully fills this sell order.
@@ -102,6 +121,7 @@ contract Escrow_sell_token(
     //   kcc20_vault_out_idx : index of the updated KCC20 vault output
     //                         (passed as parameter: cannot be derived canonically
     //                          when LP_AMM is also present in the same transaction)
+    //   feeOutIndex         : index of the platform fee output (0.3% of kas_owed)
     //   nextKcc20Vault      : expected KCC20 vault state after the fill
     //   nextKcc20Buyer      : expected KCC20 state for the buyer
     //   buyer_pk            : public key of the buyer (receives tokens)
@@ -116,6 +136,7 @@ contract Escrow_sell_token(
         int        fill_amount,
         int        escrow_out_idx,
         int        kcc20_vault_out_idx,
+        int        feeOutIndex,
         KCC20State nextKcc20Vault,
         KCC20State nextKcc20Buyer,
         byte[32]   buyer_pk
@@ -181,7 +202,15 @@ contract Escrow_sell_token(
         require(nextKcc20Buyer.identifierType  != IDENTIFIER_COVENANT_ID);
         require(nextKcc20Buyer.amount          == fill_amount);
 
-        // ── 7. Vault update ──
+        // ── 7. Platform fee: 0.3% of kas_owed, paid by the buyer ──
+        //
+        // The fee is paid from the buyer's wallet (not from the escrow dust).
+        // The seller always receives >= kas_owed (step 5) regardless.
+        // >= instead of == allows the buyer to voluntarily overpay (tip)
+        // without the transaction being rejected.
+        checkFeeOutput(prev, feeOutIndex, kas_owed);
+
+        // ── 8. Vault update ──
         // Owner = myCovId (anti-hijacking), type = 0x02, isMinter preserved.
         // kcc20_vault_out_idx is provided by the filler; content is enforced
         // by validateOutputStateWithTemplate.
@@ -198,7 +227,7 @@ contract Escrow_sell_token(
             kcc20_hash
         );
 
-        // ── 8. Immutability and dust preservation ──
+        // ── 9. Immutability and dust preservation ──
         checkImmutable(prev, next);
         require(tx.outputs[escrow_out_idx].value >= tx.inputs[this.activeInputIndex].value);
     }

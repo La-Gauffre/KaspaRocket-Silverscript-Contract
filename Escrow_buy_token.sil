@@ -7,10 +7,12 @@ pragma silverscript ^0.1.0;
 //   - kas_per_token   : fixed price (sompi per token)
 //   - tokens_remaining: total order size in tokens (decreases with each fill)
 //   - token_id        : identifier of the KCC20 contract
+//   - fee_recipient   : platform fee address (receives 0.3% of each fill's KAS flow)
 //
 // Fill mechanism:
 //   Anyone can fill the order by supplying KCC20 tokens.
 //   In return they receive fill_amount * kas_per_token KAS from the escrow.
+//   The filler also pays a 0.3% platform fee (from their own wallet) to fee_recipient.
 //   Partial fills are supported: the escrow persists with tokens_remaining
 //   decremented until the order is fully consumed.
 //
@@ -37,10 +39,11 @@ pragma silverscript ^0.1.0;
 //   inputs:
 //     [activeInputIndex]   : this escrow UTXO (holds the KAS)
 //     [KCC20 user inputs]  : user token UTXOs (type 0x00)
-//     [user wallet]        : covers network fees
+//     [user wallet]        : covers network fees + 0.3% platform fee
 //   outputs:
 //     [escrow_out_idx]        : updated escrow (tokens_remaining decremented)
-//     [buyer_kcc20_out_idx]   : KCC20 to buyer_pk (exactly fill_amount tokens)  ← canonical
+//     [escrow_out_idx + 1]    : KCC20 to buyer_pk (exactly fill_amount tokens)  ← canonical
+//     [feeOutIndex]           : 0.3% of kas_released to fee_recipient            ← platform fee
 //     [...]                   : fill_amount * kas_per_token KAS to filler
 //     [KCC20 change, ...]     : remaining user tokens (optional)
 
@@ -50,6 +53,7 @@ contract Escrow_buy_token(
     int init_kas_per_token,
     int init_tokens_remaining,
     byte[32] init_token_id,
+    byte[36] init_fee_recipient,
     int kcc20_prefix_len,
     int kcc20_suffix_len,
     byte[32] kcc20_hash,
@@ -61,6 +65,7 @@ contract Escrow_buy_token(
     int kas_per_token        = init_kas_per_token;
     int tokens_remaining     = init_tokens_remaining;
     byte[32] token_id        = init_token_id;
+    byte[36] fee_recipient   = init_fee_recipient;
 
     struct KCC20State {
         byte[32] ownerIdentifier;
@@ -72,6 +77,10 @@ contract Escrow_buy_token(
     byte constant IDENTIFIER_PUBKEY      = 0x00;
     byte constant IDENTIFIER_SCRIPT_HASH = 0x01;
     byte constant IDENTIFIER_COVENANT_ID = 0x02;
+
+    // Platform fee: 3 / 1000 = 0.3% of the KAS flow per fill.
+    int constant FEE_NUM = 3;
+    int constant FEE_DEN = 1000;
 
     // Maximum number of user KCC20 inputs to scan in a single fill.
     int constant MAX_USER_KCC20 = 10;
@@ -87,6 +96,16 @@ contract Escrow_buy_token(
         require(next.buyer_pk      == prev.buyer_pk);
         require(next.kas_per_token == prev.kas_per_token);
         require(next.token_id      == prev.token_id);
+        require(next.fee_recipient == prev.fee_recipient);
+    }
+
+    // Fee output guard: enforces that a transaction output sends the platform fee
+    // to fee_recipient. kas_amount is the gross KAS flow of this fill (before split).
+    function checkFeeOutput(State prev, int feeOutIndex, int kas_amount) {
+        int fee = (kas_amount * FEE_NUM) / FEE_DEN;
+        require(fee > 0);
+        require(tx.outputs[feeOutIndex].value >= fee);
+        require(tx.outputs[feeOutIndex].scriptPubKey == prev.fee_recipient);
     }
 
     // fill – partially or fully fills this buy order.
@@ -95,6 +114,7 @@ contract Escrow_buy_token(
     //   escrow_out_idx      : index of the continuation output
     //   fill_amount         : number of tokens delivered in this fill
     //   buyer_kcc20_out_idx : index of the KCC20 output for buyer_pk
+    //   feeOutIndex         : index of the platform fee output (0.3% of kas_released)
     //   nextKcc20Buyer      : expected KCC20 state for the buyer output
     //
     // Canonical constraint: buyer_kcc20_out_idx == escrow_out_idx + 1
@@ -109,6 +129,7 @@ contract Escrow_buy_token(
         int        escrow_out_idx,
         int        fill_amount,
         int        buyer_kcc20_out_idx,
+        int        feeOutIndex,
         KCC20State nextKcc20Buyer
     ) {
         State prev = prevStates[0];
@@ -147,7 +168,15 @@ contract Escrow_buy_token(
         require(nextKcc20Buyer.identifierType  == IDENTIFIER_PUBKEY);
         require(nextKcc20Buyer.amount          == fill_amount);
 
-        // ── 4. Anti-double-spend: count only user-owned tokens ──
+        // ── 4. Platform fee: 0.3% of kas_released, paid by the filler ──
+        //
+        // The fee is paid from the filler's wallet (not from the escrow KAS).
+        // The escrow KAS accounting (step 2) is therefore unaffected.
+        // >= instead of == allows the filler to voluntarily overpay (tip)
+        // without the transaction being rejected.
+        checkFeeOutput(prev, feeOutIndex, kas_released);
+
+        // ── 5. Anti-double-spend: count only user-owned tokens ──
         //
         // Scan all KCC20 inputs and sum only those with identifierType ≠ 0x02.
         // Covenant vaults (LP_AMM, other escrows) are excluded; the filler must
@@ -168,7 +197,7 @@ contract Escrow_buy_token(
         }
         require(user_tokens_in >= fill_amount);
 
-        // ── 5. State update ──
+        // ── 6. State update ──
         checkImmutable(prev, next);
         require(next.tokens_remaining == prev.tokens_remaining - fill_amount);
     }
