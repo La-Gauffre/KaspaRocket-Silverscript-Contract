@@ -5,10 +5,10 @@ pragma silverscript ^0.1.0;
 // Transaction structure expected for each swap:
 //   inputs:
 //     [activeInputIndex] : vault covenant UTXO   (managed by this contract)
-//     [any other index]  : user wallet UTXO       (covers swap amount + 3% fee + network fee)
+//     [any other index]  : user wallet UTXO       (covers swap amount + 0.3% fee + network fee)
 //   outputs:
 //     [outIndex]         : vault covenant UTXO   (same scriptPubKey, updated state)
-//     [feeOutIndex]      : platform fee address  (3% of KAS flow)
+//     [feeOutIndex]      : platform fee address  (0.3% of KAS flow)
 //     [...]              : user change / token receipt (not verified here)
 //
 // Network fees are NOT managed by this contract; they are implicitly consumed
@@ -43,9 +43,9 @@ contract LP_AMM(
         bool isMinter;
     }
 
-    // Fee: 3 / 100
+    // Fee: 3 / 1000 = 0.3%
     int constant FEE_NUM = 3;
-    int constant FEE_DEN = 100;
+    int constant FEE_DEN = 1000;
 
     // Overflow-safe bounds for bonding curve arithmetic.
     // The integral area formula evaluates (a * v / 2) * v.
@@ -218,7 +218,7 @@ contract LP_AMM(
             // ── PHASE 2: CONSTANT-PRODUCT AMM ──
             // Invariant: t_in × k_in == k_out × t_out
             //
-            // The 3% fee is paid directly from the user's wallet to fee_recipient
+            // The 0.3% fee is paid directly from the user's wallet to fee_recipient
             // and never passes through the vault, so it does not alter the K product.
 
             require(next.binary_flag == 1);
