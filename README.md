@@ -11,7 +11,7 @@ The Liquidity Pool operates using a unique dual-phase mathematical model:
 
 **Key Features:**
 - **Robust Security:** Prevents input spoofing attacks by rigorously verifying covenant ownership IDs (`ownerIdentifier == myCovId`).
-- **Platform Fee:** Seamlessly integrates a 3% platform fee that is routed directly to a specified fee recipient address without interfering with the mathematical invariants.
+- **Platform Fee:** Seamlessly integrates a 0.3% platform fee that is routed directly to a specified fee recipient address without interfering with the mathematical invariants.
 - **Overflow-Safe:** Incorporates mathematically verified bounds to prevent integer overflows during complex bonding curve integration calculations.
 
 ### 2. `Escrow_buy_token.sil` (Limit Buy Order)
@@ -19,12 +19,14 @@ A decentralized limit buy order contract allowing users to securely lock KAS in 
 - **Mechanism:** The creator locks KAS and specifies a fixed price (`kas_per_token`), the total tokens desired, and the buyer's public key.
 - **Filling:** Anyone can fill this order (partially or fully) by supplying the requested KCC20 tokens. In return, the filler receives the KAS locked in the escrow.
 - **Anti-Aliasing:** Enforces canonical output indexing (`buyer_kcc20_out_idx == escrow_out_idx + 1`) to guarantee that the tokens are truly delivered to the buyer, preventing aliasing attacks.
+- **Platform Fee:** Applies a 0.3% fee on the execution.
 
 ### 3. `Escrow_sell_token.sil` (Limit Sell Order)
 A decentralized limit sell order contract allowing users to securely lock tokens in exchange for KAS.
 - **Mechanism:** The creator locks KCC20 tokens inside a covenant-owned vault and specifies a fixed KAS price per token, along with the seller's KAS payout address (`seller_spk`).
 - **Filling:** Anyone can fill the order by sending the required KAS to the seller. They receive the locked tokens from the vault in return.
 - **Vault Identification:** Uses robust ID scanning (`vault_count == 1`) to accurately identify its specific vault among all transaction inputs, allowing it to coexist safely with other protocol vaults in the same transaction.
+- **Platform Fee:** Applies a 0.3% fee on the execution.
 
 ## Composability & Interoperability
 
