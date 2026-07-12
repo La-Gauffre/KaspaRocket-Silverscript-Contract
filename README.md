@@ -6,7 +6,7 @@ This repository contains advanced Silverscript smart contracts for KCC20 token t
 
 ### 1. `LP_AMM.sil` (Liquidity Pool AMM)
 The Liquidity Pool operates using a unique dual-phase mathematical model:
-- **Phase 1 (Bonding Curve):** Initially, the token price is determined dynamically along a linear bonding curve defined by `Price(S) = a * S + b`. Users can mint/buy or burn/sell tokens directly against this curve.
+- **Phase 1 (Bonding Curve):** Initially, the token price is determined dynamically along a linear bonding curve defined by `Price(S) = a * S + b`. Users can buy or sell tokens directly against this curve.
 - **Phase 2 (Constant-Product AMM):** Once a predefined supply threshold (`S1`) is reached, the contract irreversibly transitions to a standard constant-product AMM model (similar to Uniswap V2) where `k = reserve_kas * reserve_tokens`.
 
 **Key Features:**
