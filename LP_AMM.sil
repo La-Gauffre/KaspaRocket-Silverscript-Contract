@@ -74,7 +74,7 @@ contract LP_AMM(
         int fee = (kas_amount * FEE_NUM) / FEE_DEN;
         require(fee > 0);
         require(tx.outputs[feeOutIndex].value >= fee);
-        require(tx.outputs[feeOutIndex].scriptPubKey == prev.fee_recipient);
+        require(tx.outputs[feeOutIndex].scriptPubKey == byte[](prev.fee_recipient));
     }
 
     #[covenant(binding = cov, from = 1, to = 1)]
@@ -82,7 +82,7 @@ contract LP_AMM(
         State[] prevStates,
         State[] newStates,
         int outIndex,       // index of the vault continuation output
-        int feeOutIndex,    // index of the platform fee output (3% KAS)
+        int feeOutIndex,    // index of the platform fee output (0.3% KAS)
         byte[] userAddress,
         int amount,
         bool isBuy,
@@ -92,6 +92,9 @@ contract LP_AMM(
         State next = newStates[0];
 
         checkImmutableState(prev, next);
+
+        byte[32] myCovId = OpInputCovenantId(this.activeInputIndex);
+        require(outIndex == OpCovOutputIdx(myCovId, 0));
 
         int kcc20_in_idx  = OpCovInputIdx(prev.token_id, 0);
         int kcc20_out_idx = OpCovOutputIdx(prev.token_id, 0);
@@ -118,8 +121,6 @@ contract LP_AMM(
         //
         // Multiple KCC20 inputs with the same token_id are legitimate (user selling
         // multiple own UTXOs), but only ONE may have owner == myCovId.
-        byte[32] myCovId = OpInputCovenantId(this.activeInputIndex);
-
         require(kcc20PrevState.ownerIdentifier == myCovId);
         require(kcc20PrevState.identifierType == 0x02);
 

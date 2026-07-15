@@ -1,0 +1,36 @@
+name: Compile contracts
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85.0"
+
+      - name: Build pinned SilverScript compiler
+        shell: bash
+        run: |
+          compiler_commit="$(cat SILVERSCRIPT_COMMIT)"
+          git clone https://github.com/kaspanet/silverscript.git "$RUNNER_TEMP/silverscript"
+          git -C "$RUNNER_TEMP/silverscript" checkout --detach "$compiler_commit"
+          cargo build \
+            --manifest-path "$RUNNER_TEMP/silverscript/Cargo.toml" \
+            --release \
+            --package silverscript-lang \
+            --bin silverc
+
+      - name: Compile all contracts
+        env:
+          SILVERC: ${{ runner.temp }}/silverscript/target/release/silverc
+        run: ./tests/compile.sh

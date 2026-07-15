@@ -50,3 +50,16 @@ If an `Escrow_sell_token` offers tokens at a lower price than the `LP_AMM`'s bid
 
 ### Conclusion
 By enforcing strict canonical output paths and distinguishing between user-owned (`0x00`/`0x01`) and protocol-owned (`0x02`) tokens, the KaspaRocket ecosystem enables highly liquid, secure, and fully composable on-chain trading directly on Kaspa Layer 1.
+
+## Reproducible compilation
+
+The compiler revision used by CI is pinned in `SILVERSCRIPT_COMMIT`. To run the
+same checks locally, build that SilverScript revision and provide the compiler
+binary through `SILVERC`:
+
+```bash
+SILVERC=/path/to/silverc ./tests/compile.sh
+```
+
+The compile check uses representative constructor arguments and requires all
+three contracts to produce non-empty JSON artifacts.
