@@ -110,7 +110,7 @@ contract Escrow_sell_token(
         int fee = (kas_amount * FEE_NUM) / FEE_DEN;
         require(fee > 0);
         require(tx.outputs[feeOutIndex].value >= fee);
-        require(tx.outputs[feeOutIndex].scriptPubKey == prev.fee_recipient);
+        require(tx.outputs[feeOutIndex].scriptPubKey == byte[](prev.fee_recipient));
     }
 
     // fill – partially or fully fills this sell order.
@@ -181,6 +181,7 @@ contract Escrow_sell_token(
         int kas_owed = fill_amount * prev.kas_per_token;
 
         // ── 4. Canonical output indices (anti-aliasing) ──
+        require(escrow_out_idx == OpCovOutputIdx(myCovId, 0));
         int kcc20_buyer_idx = escrow_out_idx + 1;
         int seller_kas_idx  = escrow_out_idx + 2;
 
@@ -188,9 +189,10 @@ contract Escrow_sell_token(
         // The source of the KAS (direct wallet or LP_AMM arbitrageur) is
         // intentionally unconstrained: the seller always receives their agreed price.
         require(tx.outputs[seller_kas_idx].value        >= kas_owed);
-        require(tx.outputs[seller_kas_idx].scriptPubKey == prev.seller_spk);
+        require(tx.outputs[seller_kas_idx].scriptPubKey == byte[](prev.seller_spk));
 
         // ── 6. Token delivery to buyer ──
+        require(OpOutputCovenantId(kcc20_buyer_idx) == prev.token_id);
         validateOutputStateWithTemplate(
             kcc20_buyer_idx,
             nextKcc20Buyer,
@@ -199,8 +201,9 @@ contract Escrow_sell_token(
             kcc20_hash
         );
         require(nextKcc20Buyer.ownerIdentifier == buyer_pk);
-        require(nextKcc20Buyer.identifierType  != IDENTIFIER_COVENANT_ID);
+        require(nextKcc20Buyer.identifierType  == IDENTIFIER_PUBKEY);
         require(nextKcc20Buyer.amount          == fill_amount);
+        require(!nextKcc20Buyer.isMinter);
 
         // ── 7. Platform fee: 0.3% of kas_owed, paid by the buyer ──
         //
@@ -219,6 +222,7 @@ contract Escrow_sell_token(
         require(nextKcc20Vault.isMinter        == vault_is_minter);
         require(nextKcc20Vault.amount          == tokens_in_vault - fill_amount);
 
+        require(OpOutputCovenantId(kcc20_vault_out_idx) == prev.token_id);
         validateOutputStateWithTemplate(
             kcc20_vault_out_idx,
             nextKcc20Vault,
@@ -240,6 +244,7 @@ contract Escrow_sell_token(
     #[covenant.singleton(mode = transition, termination = allowed)]
     function cancel(State prev_state, State[] next_states, sig creator_sig) : (State[]) {
         require(checkSig(creator_sig, prev_state.creator_pk));
+        require(next_states.length == 0);
         return next_states;
     }
 }
