@@ -2,20 +2,55 @@ pragma silverscript ^0.1.0;
 
 // LP_AMM – Dual-phase liquidity pool (Bonding Curve → AMM)
 //
+// Config A: 65/35 split with exact price continuity.
+//   - Supply: 1,000,000,000 tokens
+//   - S1 = 650,000,000 (65%) → switch to AMM
+//   - Recommended: a_num=1, a_den=19,716, b=2,747 → ~125K KAS collected
+//   - Price continuity: P(S1) ≈ k_in/t_in (Δ ≈ 1 sompi)
+//
+// Changes from the previous on-chain LP_AMM:
+//   1. Fractional slope: `a` is now represented as a_num / a_den to support
+//      very small slopes (e.g. a = 1 / 19_716 ≈ 5.07 × 10⁻⁵).
+//      This enables smooth price continuity between bonding curve and AMM phases.
+//   2. Minimum fee: fee = max(MIN_FEE, 0.3% of kas_amount) to prevent
+//      dust attacks with tiny amounts.
+//   3. Covenant output binding (from PR #3, w00c00): `outIndex` was an
+//      unconstrained witness argument that the contract never read. It is now
+//      pinned to the canonical vault continuation output, OpCovOutputIdx(myCovId,
+//      0) — the same index the covenant wrapper validates the output state
+//      against. Any transaction builder MUST now pass the real index.
+//   4. Explicit byte[] cast on the fee_recipient comparison (from PR #3, w00c00).
+//      `scriptPubKey` is typed byte[] and `fee_recipient` is byte[36]; the
+//      compiler enforces exact type equality in comparisons, so the cast is
+//      required to compile. It emits no opcode — bytecode is unchanged.
+//   5. Bonding curve hard cap S2 = S1 + S2_MARGIN. A phase 1 buy used to be
+//      bounded only by MAX_SUPPLY, so a single transaction could push S from 0 to
+//      the whole supply — buying out the curve AND the token reserve meant for
+//      the AMM, leaving phase 2 to open with a near-empty pool. S2 caps the
+//      overshoot past S1: a phase 1 buy may cross the S1 threshold (needed to
+//      flip to AMM) but never beyond S2, so the AMM always opens with its
+//      intended reserve and the P(S1) ≈ k_in/t_in continuity property holds.
+//
+// Note on token binding: unlike the Escrow contracts, LP_AMM needs no explicit
+// OpOutputCovenantId(...) == token_id check. Both KCC20 indices are already
+// *derived* from prev.token_id via OpCovInputIdx / OpCovOutputIdx, so the token
+// identity is structural rather than witness-supplied.
+//
 // Transaction structure expected for each swap:
 //   inputs:
 //     [activeInputIndex] : vault covenant UTXO   (managed by this contract)
-//     [any other index]  : user wallet UTXO       (covers swap amount + 0.3% fee + network fee)
+//     [any other index]  : user wallet UTXO       (covers swap amount + fee + network fee)
 //   outputs:
 //     [outIndex]         : vault covenant UTXO   (same scriptPubKey, updated state)
-//     [feeOutIndex]      : platform fee address  (0.3% of KAS flow)
+//     [feeOutIndex]      : platform fee address  (max(2 KAS, 0.3%) of KAS flow)
 //     [...]              : user change / token receipt (not verified here)
 //
 // Network fees are NOT managed by this contract; they are implicitly consumed
 // by the difference between the user's wallet input(s) and their change output(s).
 
 contract LP_AMM(
-    int init_a,
+    int init_a_num,
+    int init_a_den,
     int init_b,
     int init_S1,
     int init_S,
@@ -29,9 +64,10 @@ contract LP_AMM(
     byte[] kcc20_suffix
 ) {
     int binary_flag = init_binary_flag;        // 0: bonding curve, 1: AMM (irreversible once set to 1)
-    int a = init_a;
+    int a_num = init_a_num;
+    int a_den = init_a_den;
     int b = init_b;
-    int S1 = init_S1;
+    int S1 = init_S1;        // bonding curve → AMM threshold
     int S = init_S;
     byte[32] token_id = init_token_id;
     byte[36] fee_recipient = init_fee_recipient;
@@ -47,21 +83,56 @@ contract LP_AMM(
     int constant FEE_NUM = 3;
     int constant FEE_DEN = 1000;
 
+    // Minimum fee: 2 KAS = 200_000_000 sompi
+    // Prevents dust attacks where tiny swaps would incur negligible fees.
+    int constant MIN_FEE = 200_000_000;
+
     // Overflow-safe bounds for bonding curve arithmetic.
-    // The integral area formula evaluates (a * v / 2) * v.
-    // With MAX_A = 10_000 and MAX_SUPPLY = 10_000_000:
-    //   peak intermediate = (10_000 × 10_000_000 / 2) × 10_000_000
-    //                     = 5 × 10^17  <  int64_max (9.22 × 10^18) ✓
-    int constant MAX_A      = 10_000;
+    // The integral area formula evaluates (a_num * v / 2) * v / a_den.
+    // We must ensure (a_num * MAX_SUPPLY / 2) * MAX_SUPPLY fits int64.
+    //
+    // With MAX_A_NUM = 18 and MAX_SUPPLY = 1_000_000_000:
+    //   peak = (18 × 1_000_000_000 / 2) × 1_000_000_000
+    //        = 9 × 10^18  < int64_max (9.22 × 10^18) ✓  (margin: 2.4%)
+    //
+    // Formula: MAX_A_NUM ≤ floor(2 × int64_max / MAX_SUPPLY²)
+    //        = floor(2 × 9.22 × 10^18 / 10^18) = 18
+    int constant MAX_A_NUM  = 18;
     int constant MAX_B      = 1_000_000_000;
-    int constant MAX_SUPPLY = 10_000_000;
+    int constant MAX_SUPPLY = 1_000_000_000;
+
+    // Minimum token reserve in Phase 2 AMM buy.
+    // Prevents overflow of (k_in / t_out) * amount when t_out approaches 0.
+    // With k_in ≈ 12.5 × 10^12 and MIN_T_OUT = 1000:
+    //   (12.5 × 10^12 / 1000) × 350M = 4.375 × 10^18 < int64_max ✓
+    // Without this guard (t_out = 1):
+    //   12.5 × 10^12 × 350M = 4.375 × 10^21 → OVERFLOW!
+    int constant MIN_T_OUT = 1_000;
+
+    // Bonding curve hard cap margin, in TOKENS (S, S1 and S2 count tokens — they are
+    // NOT sompi amounts; `b` is the sompi-per-token price).
+    //
+    // S2 = S1 + S2_MARGIN is the highest supply a phase 1 buy may ever reach. The
+    // margin must stay > 0 so a buy can still cross S1 and flip the phase to AMM.
+    //
+    // Sized as ≈ 1 KAS of purchase at the Config A threshold price:
+    //   Price(S1) = S1/a_den + b = 650_000_000/19_716 + 2_747 ≈ 35_714 sompi/token
+    //   1 KAS = 100_000_000 sompi ≈ 2_800 tokens → rounded up to 3_000
+    //
+    // Note: this is an ABSOLUTE margin, so its weight relative to S1 depends on the
+    // deployment. At S1 = 650_000_000 it is 0.00046% of the threshold; on a pool
+    // deployed with a small S1 it is proportionally far looser. Scale it with S1
+    // instead (prev.S1 / 100 for a 1% overshoot) if you need a bound that holds
+    // uniformly across very different supplies.
+    int constant S2_MARGIN = 3_000;
 
     // Maximum number of additional KCC20 inputs to scan for duplicate-vault detection.
     int constant MAX_KCC20_SCAN = 10;
 
     // Immutability guard: economic parameters must never change.
     function checkImmutableState(State prev, State next) {
-        require(next.a == prev.a);
+        require(next.a_num == prev.a_num);
+        require(next.a_den == prev.a_den);
         require(next.b == prev.b);
         require(next.S1 == prev.S1);
         require(next.token_id == prev.token_id);
@@ -69,9 +140,14 @@ contract LP_AMM(
     }
 
     // Fee output guard: enforces that a transaction output sends the platform fee
-    // to fee_recipient. kas_amount is the gross KAS flow of this swap (before split).
+    // to fee_recipient. kas_amount is the gross KAS flow of this swap.
+    // Fee = max(MIN_FEE, 0.3% of kas_amount).
     function checkFeeOutput(State prev, int feeOutIndex, int kas_amount) {
-        int fee = (kas_amount * FEE_NUM) / FEE_DEN;
+        int pct_fee = (kas_amount * FEE_NUM) / FEE_DEN;
+        int fee = pct_fee;
+        if (MIN_FEE > pct_fee) {
+            fee = MIN_FEE;
+        }
         require(fee > 0);
         require(tx.outputs[feeOutIndex].value >= fee);
         require(tx.outputs[feeOutIndex].scriptPubKey == byte[](prev.fee_recipient));
@@ -82,7 +158,7 @@ contract LP_AMM(
         State[] prevStates,
         State[] newStates,
         int outIndex,       // index of the vault continuation output
-        int feeOutIndex,    // index of the platform fee output (0.3% KAS)
+        int feeOutIndex,    // index of the platform fee output
         byte[] userAddress,
         int amount,
         bool isBuy,
@@ -93,6 +169,10 @@ contract LP_AMM(
 
         checkImmutableState(prev, next);
 
+        // ── Covenant output binding ──
+        //
+        // outIndex is witness-supplied. Pin it to the canonical vault continuation
+        // output so it can never designate an unrelated output of the transaction.
         byte[32] myCovId = OpInputCovenantId(this.activeInputIndex);
         require(outIndex == OpCovOutputIdx(myCovId, 0));
 
@@ -145,23 +225,42 @@ contract LP_AMM(
 
         if (prev.binary_flag == 0) {
             // ── PHASE 1: BONDING CURVE ──
-            // Price(S) = a·S + b  (linear marginal price)
+            // Price(S) = (a_num/a_den)·S + b  (linear marginal price, fractional slope)
             // Cost     = ∫[S → S+Δ] Price(x)dx = area1 − area0
+            //
+            // area(V) = (a_num · V² / 2) / a_den + b · V
+            //
+            // Division by a_den is performed AFTER the quadratic term to
+            // maximise precision in integer arithmetic.
+
+            // Denominator must be positive (well-formed fraction).
+            require(prev.a_den > 0);
 
             if (isBuy) {
                 // User buys `amount` tokens, pays KAS into vault.
                 int v0 = prev.S;
                 int v1 = prev.S + amount;
 
-                // Overflow guard: bounds ensure (a * v / 2) * v never exceeds int64_max.
-                require(prev.a <= MAX_A);
+                // Overflow guard: bounds ensure (a_num * v / 2) * v never exceeds int64_max.
+                require(prev.a_num <= MAX_A_NUM);
                 require(prev.b <= MAX_B);
                 require(v1 <= MAX_SUPPLY);
 
-                // Integral: a·V²/2 + b·V  (reformulated to halve the peak intermediate)
-                int area0 = (prev.a * v0 / 2) * v0 + (prev.b * v0);
-                int area1 = (prev.a * v1 / 2) * v1 + (prev.b * v1);
-                int cost  = area1 - area0;
+                // Bonding curve hard cap: a single buy may cross S1 to flip the
+                // phase, but can never drain past S2 into the AMM's token reserve.
+                require(v1 <= prev.S1 + S2_MARGIN);
+
+                // Integral with fractional slope:
+                //   raw_area(V) = (a_num * V / 2) * V   (before dividing by a_den)
+                //   area(V)     = raw_area(V) / a_den + b * V
+                int raw0 = (prev.a_num * v0 / 2) * v0;
+                int raw1 = (prev.a_num * v1 / 2) * v1;
+
+                // Ceiling division for the quadratic delta to protect the pool:
+                // cost rounds UP so the buyer always pays at least the theoretical cost.
+                int raw_delta = raw1 - raw0;
+                int quad_cost = (raw_delta + prev.a_den - 1) / prev.a_den;
+                int cost = quad_cost + (prev.b * v1) - (prev.b * v0);
 
                 require(k_out >= k_in + cost);
                 checkFeeOutput(prev, feeOutIndex, cost);
@@ -190,13 +289,18 @@ contract LP_AMM(
                 int v0 = prev.S;
                 int v1 = prev.S - amount;
 
-                require(prev.a <= MAX_A);
+                require(prev.a_num <= MAX_A_NUM);
                 require(prev.b <= MAX_B);
                 require(v0 <= MAX_SUPPLY);
 
-                int area0  = (prev.a * v0 / 2) * v0 + (prev.b * v0);
-                int area1  = (prev.a * v1 / 2) * v1 + (prev.b * v1);
-                int refund = area0 - area1;
+                int raw0 = (prev.a_num * v0 / 2) * v0;
+                int raw1 = (prev.a_num * v1 / 2) * v1;
+
+                // Floor division for refund: the seller receives at most the
+                // theoretical refund (protects the pool from rounding drain).
+                int raw_delta = raw0 - raw1;
+                int quad_refund = raw_delta / prev.a_den;
+                int refund = quad_refund + (prev.b * v0) - (prev.b * v1);
 
                 require(refund <= k_in);
                 require(k_out >= k_in - refund);
@@ -219,7 +323,7 @@ contract LP_AMM(
             // ── PHASE 2: CONSTANT-PRODUCT AMM ──
             // Invariant: t_in × k_in == k_out × t_out
             //
-            // The 0.3% fee is paid directly from the user's wallet to fee_recipient
+            // The fee is paid directly from the user's wallet to fee_recipient
             // and never passes through the vault, so it does not alter the K product.
 
             require(next.binary_flag == 1);
@@ -232,6 +336,9 @@ contract LP_AMM(
                 require(amount < t_in);
 
                 int t_out = t_in - amount;
+
+                // Overflow guard: prevent (k_in / t_out) * amount from exceeding int64.
+                require(t_out >= MIN_T_OUT);
 
                 // Overflow-safe constant-product invariant: k_gained = ceil((k_in * amount) / t_out)
                 int k_gained = (k_in / t_out) * amount + ((k_in % t_out) * amount + t_out - 1) / t_out;

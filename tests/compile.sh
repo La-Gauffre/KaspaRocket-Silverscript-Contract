@@ -26,10 +26,16 @@ def byte_array(length):
     }
 
 fixtures = {
+    # LP_AMM now takes a fractional slope (a_num / a_den) instead of a single `a`,
+    # so this fixture carries 13 constructor arguments. Values follow the Config A
+    # example documented at the top of LP_AMM.sil.
     "lp-amm.json": [
-        integer(1), integer(1000), integer(100), integer(0), integer(0),
-        byte_array(32), byte_array(36), integer(1), integer(1),
-        byte_array(32), byte_array(1), byte_array(1),
+        # a_num, a_den, b, S1, S, binary_flag
+        integer(1), integer(19716), integer(2747), integer(650000000), integer(0), integer(0),
+        # token_id, fee_recipient
+        byte_array(32), byte_array(36),
+        # kcc20 prefix_len, suffix_len, hash, prefix, suffix
+        integer(1), integer(1), byte_array(32), byte_array(1), byte_array(1),
     ],
     "escrow-buy.json": [
         byte_array(32), byte_array(32), integer(1000), integer(100),
