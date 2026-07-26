@@ -16,7 +16,15 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85.0"
+          # The SilverScript workspace declares rust-version = "1.85.0", but that
+          # declaration is stale and 1.85.0 cannot build the revision pinned in
+          # SILVERSCRIPT_COMMIT. Two independent constraints raise the floor:
+          #   - the pinned revision uses let-chains, stabilised in Rust 1.88;
+          #   - its rusty-kaspa v2.0.1 dependencies (kaspa-txscript, kaspa-hashes,
+          #     kaspa-consensus-core, …) all declare rust-version = "1.91.0".
+          # Pinned rather than "stable" so the toolchain stays reproducible
+          # alongside SILVERSCRIPT_COMMIT.
+          toolchain: "1.91.0"
 
       - name: Build pinned SilverScript compiler
         shell: bash
