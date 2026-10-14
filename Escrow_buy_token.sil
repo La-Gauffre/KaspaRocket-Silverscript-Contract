@@ -1,53 +1,12 @@
 pragma silverscript ^0.1.0;
 
-// Escrow_buy_token – Limit buy order: locked KAS → KCC20 tokens
+// Escrow_buy_token — limit BUY order for one KCC20 token.
 //
-// The creator locks KAS and specifies:
-//   - buyer_pk        : public key that will receive the tokens
-//   - kas_per_token   : fixed price (sompi per token)
-//   - tokens_remaining: total order size in tokens (decreases with each fill)
-//   - token_id        : identifier of the KCC20 contract
-//   - fee_recipient   : platform fee address (receives 0.3% of each fill's KAS flow)
-//
-// Fill mechanism:
-//   Anyone can fill the order by supplying KCC20 tokens.
-//   In return they receive fill_amount * kas_per_token KAS from the escrow.
-//   The filler also pays a 0.3% platform fee (from their own wallet) to fee_recipient.
-//   Partial fills are supported: the escrow persists with tokens_remaining
-//   decremented until the order is fully consumed.
-//
-// ── Protection against "Double-Spend via LP_AMM" attack ──
-//
-// Attack scenario blocked:
-//   An attacker performs an LP_AMM buy swap that sends tokens to buyer_pk
-//   in the same transaction, then claims this satisfies the escrow —
-//   without bringing any tokens themselves.
-//
-// Defense:
-//   The contract scans ALL KCC20 inputs and only counts those with
-//   identifierType ≠ 0x02 (non-covenant). Protocol vaults (LP_AMM, other
-//   escrows) are type 0x02 and are excluded from the tally.
-//   → The attacker must hold their own tokens (type 0x00/0x01) to trigger a fill.
-//
-// Legitimate arbitrage:
-//   A market-maker holding tokens (type 0x00) may deliver them via a fill
-//   while simultaneously executing an LP_AMM swap in the same transaction.
-//   The LP_AMM vault (type 0x02) is excluded; only the market-maker's own
-//   token UTXOs are counted. This is intentionally allowed.
-//
-// Transaction structure expected for fill:
-//   inputs:
-//     [activeInputIndex]   : this escrow UTXO (holds the KAS)
-//     [KCC20 user inputs]  : user token UTXOs (type 0x00)
-//     [user wallet]        : covers network fees + 0.3% platform fee
-//   outputs:
-//     [escrow_out_idx]        : updated escrow (tokens_remaining decremented)
-//     [escrow_out_idx + 1]    : KCC20 to buyer_pk (exactly fill_amount tokens)  ← canonical
-//     [feeOutIndex]           : 0.3% of kas_released to fee_recipient            ← platform fee
-//     [...]                   : fill_amount * kas_per_token KAS to filler
-//     [KCC20 change, ...]     : remaining user tokens (optional)
-
-contract Escrow_buy_token(
+// The order creator locks KAS in this UTXO, offering kas_per_token for up to
+// tokens_remaining tokens. Anyone can fill it, fully or partially, by
+// delivering tokens to buyer_pk; the escrow releases the matching KAS. 
+// The creator can cancel at any time and take the remaining KAS back.
+contract Escrow_buy_token_KCC20ref(
     byte[32] init_creator_pk,
     byte[32] init_buyer_pk,
     int init_kas_per_token,
@@ -60,6 +19,7 @@ contract Escrow_buy_token(
     byte[] kcc20_prefix,
     byte[] kcc20_suffix
 ) {
+    // Order state: who placed it, who receives the tokens, price and size.
     byte[32] creator_pk      = init_creator_pk;
     byte[32] buyer_pk        = init_buyer_pk;
     int kas_per_token        = init_kas_per_token;
@@ -67,30 +27,58 @@ contract Escrow_buy_token(
     byte[32] token_id        = init_token_id;
     byte[36] fee_recipient   = init_fee_recipient;
 
+    // Layout of a KCC20 state, used to check the token outputs and inputs.
     struct KCC20State {
-        byte[32] ownerIdentifier;
-        byte identifierType;
+        byte[32] kcc20_template;
         int amount;
-        bool isMinter;
+        byte[32] owner;
+        byte owner_scheme;
+        byte borrow_scheme;
+        byte[32] borrow_guard;
+        byte[32] extension_commitment;
     }
 
-    byte constant IDENTIFIER_PUBKEY      = 0x00;
-    byte constant IDENTIFIER_SCRIPT_HASH = 0x01;
-    byte constant IDENTIFIER_COVENANT_ID = 0x02;
+    // KCC20 owner schemes.
+    byte constant OWNER_P2PK_SCHNORR  = 0x00;
+    byte constant OWNER_P2PKH_SCHNORR = 0x01;
+    byte constant OWNER_P2PKH_ECDSA   = 0x02;
+    byte constant OWNER_P2SH          = 0x03;
+    byte constant OWNER_COVENANT_ID   = 0x04;
 
-    // Platform fee: 3 / 1000 = 0.3% of the KAS flow per fill.
+    byte constant BORROW_DISABLED = 0x00;
+
+    // Minimum platform fee enforced on-chain: 0.3% of the KAS released.
     int constant FEE_NUM = 3;
     int constant FEE_DEN = 1000;
 
-    // Maximum number of user KCC20 inputs to scan in a single fill.
     int constant MAX_USER_KCC20 = 10;
 
-    // Overflow guards: explicit bounds before fill_amount * kas_per_token.
-    // fill_amount * kas_per_token ≤ 10_000_000 × 1_000_000_000 = 10^16 < int64_max ✓
-    int constant MAX_KAS_PER_TOKEN = 1_000_000_000;
-    int constant MAX_FILL_AMOUNT   = 10_000_000;
+    int constant MAX_KAS_FLOW = 3_000_000_000_000_000_000;
 
-    // Immutability guard: economic parameters must never change.
+    // Output layout. Each covenant input owns a block of 4 outputs at the end
+    // of the transaction, so several orders can be filled in one transaction.
+    int constant BLOCK            = 4;
+    int constant SLOT_ESCROW      = 0;
+    int constant SLOT_BUYER_TOKEN = 1;
+    int constant SLOT_SELLER_KAS  = 2;
+    int constant SLOT_FEE         = 3;
+
+    byte constant SIGHASH_ALL = 0x01;
+
+    // Shared checks.
+    function blockBase() : int {
+        int base = tx.outputs.length - BLOCK * (this.activeInputIndex + 1);
+        require(base >= 0);
+        return base;
+    }
+
+    function kasFlow(State prev, int fill_amount) : int {
+        require(prev.kas_per_token > 0);
+        require(fill_amount > 0);
+        require(fill_amount <= MAX_KAS_FLOW / prev.kas_per_token);
+        return fill_amount * prev.kas_per_token;
+    }
+
     function checkImmutable(State prev, State next) {
         require(next.creator_pk    == prev.creator_pk);
         require(next.buyer_pk      == prev.buyer_pk);
@@ -99,92 +87,34 @@ contract Escrow_buy_token(
         require(next.fee_recipient == prev.fee_recipient);
     }
 
-    // Fee output guard: enforces that a transaction output sends the platform fee
-    // to fee_recipient. kas_amount is the gross KAS flow of this fill (before split).
-    function checkFeeOutput(State prev, int feeOutIndex, int kas_amount) {
+    function checkFeeOutput(State prev, int base, int kas_amount) {
         int fee = (kas_amount * FEE_NUM) / FEE_DEN;
         require(fee > 0);
-        require(tx.outputs[feeOutIndex].value >= fee);
-        require(tx.outputs[feeOutIndex].scriptPubKey == byte[](prev.fee_recipient));
+        require(tx.outputs[base + SLOT_FEE].value >= fee);
+        require(tx.outputs[base + SLOT_FEE].scriptPubKey == byte[](prev.fee_recipient));
     }
 
-    // fill – partially or fully fills this buy order.
-    //
-    // Parameters:
-    //   escrow_out_idx      : index of the continuation output
-    //   fill_amount         : number of tokens delivered in this fill
-    //   buyer_kcc20_out_idx : index of the KCC20 output for buyer_pk
-    //   feeOutIndex         : index of the platform fee output (0.3% of kas_released)
-    //   nextKcc20Buyer      : expected KCC20 state for the buyer output
-    //
-    // Canonical constraint: buyer_kcc20_out_idx == escrow_out_idx + 1
-    //   Each escrow has a unique escrow_out_idx (covenant system guarantee).
-    //   Tying the buyer output to escrow_out_idx + 1 makes it unique per escrow,
-    //   preventing aliasing attacks where multiple escrows share the same buyer
-    //   output (which would allow draining multiple escrows for the price of one fill).
-    #[covenant(binding = cov, from = 1, to = 1)]
-    function fill(
-        State[]    prevStates,
-        State[]    newStates,
-        int        escrow_out_idx,
-        int        fill_amount,
-        int        buyer_kcc20_out_idx,
-        int        feeOutIndex,
-        KCC20State nextKcc20Buyer
-    ) {
-        State prev = prevStates[0];
-        State next = newStates[0];
-        byte[32] myCovId = OpInputCovenantId(this.activeInputIndex);
-
-        // ── 1. Amount check ──
-        require(fill_amount > 0);
-        require(fill_amount <= prev.tokens_remaining);
-
-        // ── 2. KAS flow: escrow releases exactly fill_amount * kas_per_token ──
-        // Overflow guard: bounds checked before multiplication.
-        require(prev.kas_per_token <= MAX_KAS_PER_TOKEN);
-        require(fill_amount        <= MAX_FILL_AMOUNT);
-
-        int kas_released  = fill_amount * prev.kas_per_token;
-        int escrow_kas_in = tx.inputs[this.activeInputIndex].value;
-        require(kas_released <= escrow_kas_in);
-        require(escrow_out_idx == OpCovOutputIdx(myCovId, 0));
-        require(tx.outputs[escrow_out_idx].value == escrow_kas_in - kas_released);
-
-        // ── 3. Token delivery: buyer_pk receives EXACTLY fill_amount tokens ──
-        //
-        // Canonical index (anti-aliasing):
-        //   If two escrows share the same buyer_pk and fill_amount, a simple ==
-        //   check would be fooled by pointing both at the same buyer output.
-        //   Tying the buyer index to the unique escrow output index prevents this.
-        require(buyer_kcc20_out_idx == escrow_out_idx + 1);
-        require(OpOutputCovenantId(buyer_kcc20_out_idx) == prev.token_id);
-
+    // The buyer receives exactly fill_amount tokens, as a plain KCC20 UTXO.
+    function checkBuyerTokenOutput(State prev, int base, KCC20State expected, int fill_amount) {
+        int out_idx = base + SLOT_BUYER_TOKEN;
         validateOutputStateWithTemplate(
-            buyer_kcc20_out_idx,
-            nextKcc20Buyer,
+            out_idx,
+            expected,
             kcc20_prefix,
             kcc20_suffix,
             kcc20_hash
         );
-        require(nextKcc20Buyer.ownerIdentifier == prev.buyer_pk);
-        require(nextKcc20Buyer.identifierType  == IDENTIFIER_PUBKEY);
-        require(nextKcc20Buyer.amount          == fill_amount);
-        require(!nextKcc20Buyer.isMinter);
+        require(OpOutputCovenantId(out_idx) == prev.token_id);
+        require(expected.kcc20_template == kcc20_hash);
+        require(expected.owner         == prev.buyer_pk);
+        require(expected.owner_scheme  == OWNER_P2PK_SCHNORR);
+        require(expected.borrow_scheme == BORROW_DISABLED);
+        require(expected.amount        == fill_amount);
+    }
 
-        // ── 4. Platform fee: 0.3% of kas_released, paid by the filler ──
-        //
-        // The fee is paid from the filler's wallet (not from the escrow KAS).
-        // The escrow KAS accounting (step 2) is therefore unaffected.
-        // >= instead of == allows the filler to voluntarily overpay (tip)
-        // without the transaction being rejected.
-        checkFeeOutput(prev, feeOutIndex, kas_released);
-
-        // ── 5. Anti-double-spend: count only user-owned tokens ──
-        //
-        // Scan all KCC20 inputs and sum only those with identifierType ≠ 0x02.
-        // Covenant vaults (LP_AMM, other escrows) are excluded; the filler must
-        // bring their own tokens to satisfy this check.
+    // The filler must bring at least fill_amount tokens of its own
+    // (token inputs not held by a covenant).
+    function checkUserTokensIn(State prev, int fill_amount) {
         int kcc20_total    = OpCovInputCount(prev.token_id);
         int user_tokens_in = 0;
         for (n, 0, kcc20_total, MAX_USER_KCC20) {
@@ -195,25 +125,95 @@ contract Escrow_buy_token(
                 kcc20_suffix_len,
                 kcc20_hash
             );
-            if (kcc20In.identifierType != IDENTIFIER_COVENANT_ID) {
+            if (kcc20In.owner_scheme != OWNER_COVENANT_ID) {
                 user_tokens_in = user_tokens_in + kcc20In.amount;
             }
         }
         require(user_tokens_in >= fill_amount);
+    }
 
-        // ── 6. State update ──
+    // fill — partial fill. The order continues with fewer tokens remaining
+    // and the released KAS removed from its value.
+    #[covenant(binding = auth, from = 1, to = 1, groups = single)]
+    function fill(
+        State      prev,
+        State[]    newStates,
+        int        fill_amount,
+        KCC20State nextKcc20Buyer
+    ) {
+        require(newStates.length == 1);
+        State next = newStates[0];
+
+        require(fill_amount > 0);
+        require(fill_amount < prev.tokens_remaining);
+
+        int base = blockBase();
+
+        require(OpAuthOutputIdx(this.activeInputIndex, 0) == base + SLOT_ESCROW);
+
+        int kas_released  = kasFlow(prev, fill_amount);
+        int escrow_kas_in = tx.inputs[this.activeInputIndex].value;
+        require(kas_released <= escrow_kas_in);
+        require(tx.outputs[base + SLOT_ESCROW].value == escrow_kas_in - kas_released);
+
+        checkBuyerTokenOutput(prev, base, nextKcc20Buyer, fill_amount);
+
+        checkFeeOutput(prev, base, kas_released);
+
+        checkUserTokensIn(prev, fill_amount);
+
         checkImmutable(prev, next);
         require(next.tokens_remaining == prev.tokens_remaining - fill_amount);
     }
 
-    // cancel – the creator recovers all locked KAS.
-    //
-    // With termination=allowed, an empty next_states array terminates the covenant
-    // without a continuation output.
+    // close_fill — fills the whole remainder and closes the order. Any KAS
+    // left over is refunded to the creator.
+    #[covenant(binding = auth, from = 1, to = 1, groups = single)]
+    function close_fill(
+        State      prev,
+        State[]    newStates,
+        int        fill_amount,
+        KCC20State nextKcc20Buyer
+    ) {
+        require(newStates.length == 0);
+
+        require(fill_amount > 0);
+        require(fill_amount == prev.tokens_remaining);
+
+        int base = blockBase();
+
+        int kas_released  = kasFlow(prev, fill_amount);
+        int escrow_kas_in = tx.inputs[this.activeInputIndex].value;
+        require(kas_released <= escrow_kas_in);
+
+        checkBuyerTokenOutput(prev, base, nextKcc20Buyer, fill_amount);
+
+        checkFeeOutput(prev, base, kas_released);
+
+        int leftover_kas = escrow_kas_in - kas_released;
+        if (leftover_kas > 0) {
+            byte[] creator_spk = byte[](new ScriptPubKeyP2PK(pubkey(prev.creator_pk)));
+            require(tx.outputs[base + SLOT_ESCROW].value        == leftover_kas);
+            require(tx.outputs[base + SLOT_ESCROW].scriptPubKey == creator_spk);
+        }
+
+        checkUserTokensIn(prev, fill_amount);
+    }
+
+    // cancel — the creator closes the order and takes all of its KAS back.
     #[covenant.singleton(mode = transition, termination = allowed)]
     function cancel(State prev_state, State[] next_states, sig creator_sig) : (State[]) {
-        require(checkSig(creator_sig, prev_state.creator_pk));
+        byte[] raw_sig = byte[](creator_sig);
+        require(raw_sig.length == 65);
+        require(raw_sig[64] == SIGHASH_ALL);
+        require(checkSig(creator_sig, pubkey(prev_state.creator_pk)));
+
         require(next_states.length == 0);
+
+        byte[] creator_spk = byte[](new ScriptPubKeyP2PK(pubkey(prev_state.creator_pk)));
+        require(tx.outputs[this.activeInputIndex].scriptPubKey == creator_spk);
+        require(tx.outputs[this.activeInputIndex].value >= tx.inputs[this.activeInputIndex].value);
+
         return next_states;
     }
 }
