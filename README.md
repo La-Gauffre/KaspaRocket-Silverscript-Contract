@@ -1,65 +1,78 @@
-# KaspaRocket Silverscript Contracts
+# KaspaRocket SilverScript Contracts
 
-This repository contains advanced Silverscript smart contracts for KCC20 token trading on Kaspa. It features an Automated Market Maker (AMM) with a dual-phase bonding curve and non-custodial escrow contracts for decentralized limit orders.
+> **Note:** this README was written with AI assistance.
 
-## Contracts Overview
+SilverScript covenant contracts for trading KCC20 tokens on Kaspa Layer 1. They are the on-chain core of [KaspaRocket](https://kasparocket.fun) and are written for **SilverScript 1.0**.
 
-### 1. `LP_AMM.sil` (Liquidity Pool AMM)
-The Liquidity Pool operates using a unique dual-phase mathematical model:
-- **Phase 1 (Bonding Curve):** Initially, the token price is determined dynamically along a linear bonding curve defined by `Price(S) = a * S + b`. Users can buy or sell tokens directly against this curve.
-- **Phase 2 (Constant-Product AMM):** Once a predefined supply threshold (`S1`) is reached, the contract irreversibly transitions to a standard constant-product AMM model (similar to Uniswap V2) where `k = reserve_kas * reserve_tokens`.
+| File | Role |
+|---|---|
+| `kcc20.sil` | KCC20 fungible token (reference template) |
+| `LP_AMM.sil` | Liquidity pool: bonding curve, then constant-product AMM |
+| `Escrow_buy_token.sil` | Limit buy order: KAS locked, exchanged for tokens |
+| `Escrow_sell_token.sil` | Limit sell order: tokens locked, exchanged for KAS |
 
-**Key Features:**
-- **Robust Security:** Prevents input spoofing attacks by rigorously verifying covenant ownership IDs (`ownerIdentifier == myCovId`).
-- **Platform Fee:** Seamlessly integrates a 0.3% platform fee that is routed directly to a specified fee recipient address without interfering with the mathematical invariants.
-- **Overflow-Safe:** Incorporates mathematically verified bounds to prevent integer overflows during complex bonding curve integration calculations.
+## `kcc20.sil`: the token
 
-### 2. `Escrow_buy_token.sil` (Limit Buy Order)
-A decentralized limit buy order contract allowing users to securely lock KAS in exchange for tokens.
-- **Mechanism:** The creator locks KAS and specifies a fixed price (`kas_per_token`), the total tokens desired, and the buyer's public key.
-- **Filling:** Anyone can fill this order (partially or fully) by supplying the requested KCC20 tokens. In return, the filler receives the KAS locked in the escrow.
-- **Anti-Aliasing:** Enforces canonical output indexing (`buyer_kcc20_out_idx == escrow_out_idx + 1`) to guarantee that the tokens are truly delivered to the buyer, preventing aliasing attacks.
-- **Platform Fee:** Applies a 0.3% fee on the execution.
+Each token UTXO carries a balance in its state: `amount`, `owner`, `owner_scheme`, plus optional borrow settings. All UTXOs of a given token share one covenant id and one script template, so other contracts can recognise a genuine token output by its template hash.
 
-### 3. `Escrow_sell_token.sil` (Limit Sell Order)
-A decentralized limit sell order contract allowing users to securely lock tokens in exchange for KAS.
-- **Mechanism:** The creator locks KCC20 tokens inside a covenant-owned vault and specifies a fixed KAS price per token, along with the seller's KAS payout address (`seller_spk`).
-- **Filling:** Anyone can fill the order by sending the required KAS to the seller. They receive the locked tokens from the vault in return.
-- **Vault Identification:** Uses robust ID scanning (`vault_count == 1`) to accurately identify its specific vault among all transaction inputs, allowing it to coexist safely with other protocol vaults in the same transaction.
-- **Platform Fee:** Applies a 0.3% fee on the execution.
+- **Owner schemes:** P2PK Schnorr, P2PKH Schnorr, P2PKH ECDSA, P2SH, or **another covenant** (`OWNER_COVENANT_ID`, `0x04`). The last one is how pools and escrows hold tokens.
+- **`transfer`:** the *leader* input. It gathers its own balance and up to 9 *delegate* inputs of the same token, checks that the outputs conserve the total amount (up to 10 outputs), and authorizes the spend.
+- **`transfer_delegator`:** a *delegate* input. It only proves its owner's consent; the leader accounts for its balance and creates the outputs.
 
-## Composability & Interoperability
+## `LP_AMM.sil`: the liquidity pool
 
-A major innovation of these contracts is their ability to securely interact with each other in a single atomic transaction. Because Silverscript operates on a UTXO model, arbitrageurs can construct transactions that simultaneously interact with an Escrow and the `LP_AMM` to execute flash-swap style trades without upfront capital.
+One pool per token, paired with KAS. The token reserve sits in a KCC20 UTXO owned by the pool's covenant (the *vault*). The KAS reserve is the value of that vault UTXO. The pool records both reserves in its state and checks, on every swap, that the vault presented matches them.
 
-### Atomic Arbitrage Scenarios
+`executeSwap` buys or sells `amount` tokens in two phases:
 
-#### Scenario A: Arbitraging a Buy Escrow using the AMM
-If an `Escrow_buy_token` offers a higher KAS price than the `LP_AMM`'s current token price, an arbitrageur can:
-1. Buy tokens from the `LP_AMM` using KAS.
-2. Immediately deliver those tokens to the `Escrow_buy_token` to receive the escrowed KAS.
+1. **Bonding curve** (`binary_flag = 0`). The price rises linearly with the supply sold, `price(S) = (a_num / a_den) · S + b`, and a trade pays the integral of that price. When `S` reaches `S1`, the pool switches to phase 2. The switch is irreversible.
+2. **Constant-product AMM** (`binary_flag = 1`). Trades follow `reserve_kas · reserve_tokens = k`, rounded in favour of the pool. A minimum token reserve is always kept.
 
-**Security Measure:** To prevent a malicious user from simply tricking the Escrow into reading the AMM's token output as their own, `Escrow_buy_token.sil` intentionally filters out tokens owned by protocol vaults (identifier type `0x02`). It only counts tokens that are genuinely owned by a user (`0x00` or `0x01`). This forces the arbitrageur to legitimately source the tokens before the escrow unlocks the KAS.
+Curve parameters, the token and the fee recipient are fixed for the pool's lifetime.
 
-#### Scenario B: Arbitraging a Sell Escrow using the AMM
-If an `Escrow_sell_token` offers tokens at a lower price than the `LP_AMM`'s bid price, an arbitrageur can:
-1. Buy tokens from the `Escrow_sell_token` by paying KAS to the seller.
-2. Immediately sell those same tokens into the `LP_AMM` to extract KAS profit.
+## `Escrow_buy_token.sil`: limit buy order
 
-**Security Measure:** Because both the `LP_AMM` and the `Escrow_sell_token` rely on KCC20 vaults, placing both in the same transaction means there are multiple `0x02` covenant inputs. `Escrow_sell_token.sil` safely handles this by specifically identifying the vault whose `ownerIdentifier` strictly matches its own `OpInputCovenantId`. This prevents vault collision or injection attacks.
+The creator locks KAS and offers `kas_per_token` for up to `tokens_remaining` tokens, delivered to `buyer_pk`.
 
-### Conclusion
-By enforcing strict canonical output paths and distinguishing between user-owned (`0x00`/`0x01`) and protocol-owned (`0x02`) tokens, the KaspaRocket ecosystem enables highly liquid, secure, and fully composable on-chain trading directly on Kaspa Layer 1.
+- **`fill`:** a partial fill. The filler delivers tokens to the buyer and receives the matching KAS. The order continues with the rest.
+- **`close_fill`:** fills the whole remainder and closes the order. Any KAS left over is refunded to the creator.
+- **`cancel`:** the creator takes all the remaining KAS back.
 
-## Reproducible compilation
+## `Escrow_sell_token.sil`: limit sell order
 
-The compiler revision used by CI is pinned in `SILVERSCRIPT_COMMIT`. To run the
-same checks locally, build that SilverScript revision and provide the compiler
-binary through `SILVERC`:
+The creator locks tokens in a vault owned by the escrow's covenant and asks `kas_per_token` for each. The KAS goes to `seller_spk`.
 
-```bash
-SILVERC=/path/to/silverc ./tests/compile.sh
+- **`fill`:** a partial fill. The buyer pays the seller and receives tokens from the vault. The vault is rebuilt with the rest.
+- **`close_fill`:** buys the whole vault and closes the order.
+- **`cancel`:** the creator takes the remaining tokens back, together with the KAS carried by the vault and the escrow.
+
+## Shared design
+
+### One transaction, many covenants
+
+Every covenant input owns a **block of 4 outputs** at the end of the transaction, derived from its input index:
+
+```
+base = tx.outputs.length - 4 * (activeInputIndex + 1)
+
+base + 0   covenant continuation (pool or escrow), or refund on close
+base + 1   tokens: the pool's updated vault, or the buyer's tokens
+base + 2   KAS to the seller (sell escrow only)
+base + 3   platform fee
 ```
 
-The compile check uses representative constructor arguments and requires all
-three contracts to produce non-empty JSON artifacts.
+Because each input reads only its own block, a single atomic transaction can combine the pool and several escrows. For example, one transaction can buy on the curve and fill resting orders at the same time, or fill an escrow with tokens just bought from the pool.
+
+### Vault identification
+
+A pool or sell escrow finds its vault among the token inputs by requiring **exactly one** token input whose owner is its own covenant id (`owner == OpInputCovenantId(this)`, `owner_scheme == 0x04`). Two vaults of different covenants in the same transaction therefore cannot be confused.
+
+The buy escrow does the opposite. It only counts tokens that are **not** held by a covenant, so a filler cannot pass off a pool's vault as tokens of its own: the tokens must really be delivered.
+
+### Fees
+
+Each contract enforces a **minimum fee of 0.3%** of the KAS traded, paid to a fee recipient fixed at creation. A platform can charge more by paying a larger fee output. The contracts only check the floor.
+
+### Integer safety
+
+Prices and amounts are bounded (maximum slope, supply and KAS flow) so that the curve arithmetic stays within 64-bit integers.
